@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+# エンジンがセッションごとに書き出す型定義
+.claude-plugin/types/

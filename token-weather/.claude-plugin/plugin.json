@@ -1,0 +1,9 @@
+{
+  "name": "token-weather",
+  "version": "0.3.0",
+  "description": "コンテキストの使用状況を天気で、このセッションが読んだ auto-memory を一覧で、右のペインに示す。カードを押すと内訳・残り時間・索引の項目が開く",
+  "author": {
+    "name": "haruki-cl"
+  },
+  "types": "./types/index.d.ts"
+}
