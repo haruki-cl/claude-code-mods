@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { EngineInterface, Register, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
 import type { Card, IndexEntry, Limit, MemoryIndex, MemoryRead, Usage } from '../types'
 import { ageDaysIn, formatAge, isMemoryIndex, loadedFilesIn, memoryFileName, memoryPathsIn, parseEntries, shorten, stem } from './memory.ts'
-import { bar, formatLeft, formatReset, formatTokens, limitColor, limitLabel, limitOrder, padCells, percentOf, sparkline, weatherFor } from './weather.ts'
+import { HOPPER, bar, formatLeft, formatReset, formatSeconds, formatTokens, hopAt, limitColor, limitLabel, limitOrder, padCells, percentOf, sparkline, stepHeights, steps, weatherFor } from './weather.ts'
 
 const PANE = 'token-weather'
 const TITLE = 'Token Weather'
@@ -25,6 +25,70 @@ const autoCompactAt = atom({ plugin: 'token-weather', key: 'autoCompactAt' } as 
 const memory = atom({ plugin: 'token-weather', key: 'memory' } as const, { index: null, reads: [] })
 const breakdown = atom({ plugin: 'token-weather', key: 'breakdown' } as const, null)
 const open = atom({ plugin: 'token-weather', key: 'open' } as const, { weather: false, limits: false, memory: false })
+const startedAt = atom({ plugin: 'token-weather', key: 'startedAt' } as const, null)
+const minute = atom({ plugin: 'token-weather', key: 'minute' } as const, 0)
+const turns = atom({ plugin: 'token-weather', key: 'turns' } as const, [])
+const hop = atom({ plugin: 'token-weather', key: 'hop' } as const, null)
+
+// 経過時間を描き直す間隔
+const MINUTE_MS = 60_000
+// Turns の段を跳ねる丸を 1 コマ進める間隔と、棒を積む段数（その上に跳ぶための 1 行を空ける）
+const HOP_MS = 120
+const STEP_ROWS = 2
+// 蓄積した値（推移・ターン時間・読んだメモリ）は $.store にも写し、再読み込みや --resume のあとに戻す。残すセッション数
+const SERIES_KEPT = 20
+
+type Series = { savedAt: number; history: number[]; turns: number[]; reads: MemoryRead[] }
+
+const seriesKey = (sessionId: string) => `series:${sessionId}`
+
+function isNumbers(x: unknown): x is number[] {
+  return Array.isArray(x) && x.every(n => typeof n === 'number')
+}
+
+function isReads(x: unknown): x is MemoryRead[] {
+  return Array.isArray(x) && x.every(r => typeof r === 'object' && r !== null && typeof (r as MemoryRead).name === 'string' && typeof (r as MemoryRead).path === 'string')
+}
+
+// 変わった系列だけ上書きして保存する
+async function saveSeries($: EngineInterface, changed: Partial<Omit<Series, 'savedAt'>>): Promise<void> {
+  try {
+    const key = seriesKey(await $.session.id())
+    const prev = ((await $.store.get(key)) ?? {}) as Partial<Series>
+    await $.store.set(key, { history: [], turns: [], reads: [], ...prev, ...changed, savedAt: await $.clock.now() })
+  } catch {
+    // 保存できなくても表示は続ける
+  }
+}
+
+// 状態が空なら保存してあった系列を戻す。古いセッションの分は消す
+async function restoreSeries($: EngineInterface): Promise<void> {
+  try {
+    const key = seriesKey(await $.session.id())
+    const saved = ((await $.store.get(key)) ?? {}) as Partial<Series>
+    if (isNumbers(saved.history)) {
+      const h = saved.history
+      await update($, history, prev => (prev.length > 0 ? prev : h))
+    }
+
+    if (isNumbers(saved.turns)) {
+      const t = saved.turns
+      await update($, turns, prev => (prev.length > 0 ? prev : t))
+    }
+
+    if (isReads(saved.reads)) {
+      const r = saved.reads
+      await update($, memory, m => (m.reads.length > 0 ? m : { ...m, reads: r }))
+    }
+
+    const keys = (await $.store.keys()).filter(k => k.startsWith('series:') && k !== key)
+    for (const old of keys.slice(0, Math.max(keys.length + 1 - SERIES_KEPT, 0))) {
+      await $.store.delete(old)
+    }
+  } catch {
+    // 戻せなくても、ここから貯め直せばよい
+  }
+}
 
 // 応答がまだ使用量を報告していなければ null
 function snapshot(context: SessionContextUsage): Usage | null {
@@ -89,13 +153,14 @@ async function absorb($: EngineInterface, b: SessionContextBreakdown): Promise<v
 // 読んだものとして覚える。同じファイルは 1 件だけ残し、読み直したら最新に上げる（keep なら動かさない）
 async function remember($: EngineInterface, read: Omit<MemoryRead, 'at'>, options?: { keep: boolean }): Promise<void> {
   const at = await $.clock.now()
-  await update($, memory, m => {
+  const next = await update($, memory, m => {
     if (options?.keep && m.reads.some(r => r.path === read.path)) {
       return m
     }
 
     return { ...m, reads: [...m.reads.filter(r => r.path !== read.path), { ...read, at }].slice(-READS_KEPT) }
   })
+  await saveSeries($, { reads: next.reads })
 }
 
 // サブエージェントでもチームメイトでもないループは、エンジン自身のもの（compaction やメモリ処理）
@@ -139,7 +204,9 @@ async function noteInjected($: EngineInterface, text: string): Promise<void> {
 async function refresh($: EngineInterface, withBreakdown: boolean): Promise<void> {
   const measured = await $.session.usage(withBreakdown ? { breakdown: 'summary' } : undefined)
   await update($, usage, () => snapshot(measured.context))
-  await update($, limits, () => toLimits(measured.rateLimits))
+  // 枠の読みがない応答（再読み込み直後など）で、持っている枠を消さない
+  await update($, limits, prev => (measured.rateLimits.length > 0 ? toLimits(measured.rateLimits) : prev))
+  await update($, startedAt, () => measured.startedAt)
 
   const b = measured.context.breakdown
   if (b) {
@@ -180,12 +247,21 @@ async function toggle($: EngineInterface): Promise<string> {
 }
 
 export const register: Register = on => {
+  // Turns の段を跳ねる丸のタイマー。メインのターンのあいだだけ動かす
+  let hopping: Timer | undefined
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: COMMAND, description: 'Open or close Token Weather (context usage as weather) on the right', immediate: true })
+    await restoreSeries($)
+    // ターンの途中で再読み込みされるとタイマーは消えるので、宙に浮いたまま止めずに消す
+    await update($, hop, () => null)
     await refresh($, true)
     for (const ms of LATE_REFRESH_MS) {
       $.clock.after(ms, () => void refresh($, true).catch(() => undefined))
     }
+
+    // 「起動してから何分」を 1 分ごとに描き直す。リロードで古いタイマーは消え、ここで張り直される
+    $.clock.every(MINUTE_MS, () => void update($, minute, n => n + 1).catch(() => undefined))
 
     // 頼まれずに開くペインは、端末が 144 列以上のときだけ横に並ぶ。狭いときは /weather で開く
     void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
@@ -195,6 +271,12 @@ export const register: Register = on => {
 
   // プロンプトが送られた時点でも取り直す。最初の応答を待たずに、起動時に載った memory files を出すため
   on('turn.start', async ($, e, next) => {
+    // 作業中は、丸が Turns の段を左から跳んでいく。止めたあとに遅れて来たコマでは動かさない
+    if (!hopping) {
+      await update($, hop, () => 0)
+      hopping = $.clock.every(HOP_MS, () => void update($, hop, n => (n === null ? null : n + 1)).catch(() => undefined))
+    }
+
     await refresh($, true)
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -207,22 +289,36 @@ export const register: Register = on => {
       const measured = snapshot(e.context)
       await update($, usage, () => measured)
       if (measured) {
-        await update($, history, list => [...list, measured.percent].slice(-HISTORY))
+        const h = await update($, history, list => [...list, measured.percent].slice(-HISTORY))
+        await saveSeries($, { history: h })
       }
 
       const detailed = await $.session.usage({ breakdown: 'summary' })
+      await update($, startedAt, () => detailed.startedAt)
       const b = detailed.context.breakdown
       if (b) {
         await absorb($, b)
       }
     }
 
-    if (e.changed.includes('rateLimits')) {
-      await update($, limits, () => toLimits(e.rateLimits))
-    }
+    // 枠は変化があったときに取り込む。状態が空（再読み込みで消えたあと）なら変化がなくても取り込む
+    await update($, limits, prev => (e.changed.includes('rateLimits') || prev.length === 0 ? toLimits(e.rateLimits) : prev))
 
     return next(e)
   })
+
+  // ターンが終わるたびに、かかった時間を控える（サブエージェントのターンは除く）。丸は止めて消す
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) {
+      hopping?.cancel()
+      hopping = undefined
+      await update($, hop, () => null)
+      const t = await update($, turns, list => [...list, e.durationMs].slice(-HISTORY))
+      await saveSeries($, { turns: t })
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // 長い作業の途中でも天気が変わるように、ツールを呼ぶたびにも測り直す。メモリを読んでいればそれも控える
   on('tool.call', async ($, e, next) => {
@@ -243,11 +339,14 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
+      await $.store.delete(seriesKey(e.sessionId)).catch(() => undefined)
       await update($, usage, () => null)
       await update($, history, () => [])
       await update($, autoCompactAt, () => null)
       await update($, memory, () => ({ index: null, reads: [] }))
       await update($, breakdown, () => null)
+      await update($, startedAt, () => null)
+      await update($, turns, () => [])
     }
 
     return next(e)
@@ -262,6 +361,11 @@ export const register: Register = on => {
     const mem = await read($, memory)
     const parts = await read($, breakdown)
     const opened = await read($, open)
+    const started = await read($, startedAt)
+    const laps = await read($, turns)
+    const frame = await read($, hop)
+    // 値は使わないが、1 分ごとの書き込みで描き直されるように読んでおく
+    await read($, minute)
     const now = await $.clock.now()
 
     // 枠線 2 と左右の余白 2 を引いた、カードの中の幅
@@ -283,6 +387,14 @@ export const register: Register = on => {
     const recent = [...mem.reads].reverse().slice(0, opened.memory ? mem.reads.length : READS_SHOWN)
     const hidden = mem.reads.length - recent.length
     const hasAuto = recent.some(r => r.how === 'auto')
+    // ターンの所要時間: 直近と平均、推移は最長を 100% として段に積み、その上を丸が跳ねる
+    const lastLap = laps.at(-1)
+    const avgLap = laps.length > 0 ? laps.reduce((a, b) => a + b, 0) / laps.length : 0
+    const longest = Math.max(...laps, 1)
+    const heights = stepHeights(laps.slice(-(inner - 6)).map(ms => (ms / longest) * 100), STEP_ROWS)
+    const chart = steps(heights, STEP_ROWS + 1)
+    // 作業していないときは丸を出さない
+    const hopper = frame === null ? undefined : hopAt(heights, frame)
 
     return (
       <Box flexDirection="column">
@@ -324,6 +436,36 @@ export const register: Register = on => {
                 <Text dimColor>🌫 Not measured yet</Text> <Text dimColor>{mark('weather')}</Text>
               </Button>
               <Text dimColor>Shows after the first reply</Text>
+            </Box>
+          )}
+          {started !== null && <Text dimColor>⏱ {formatLeft(now - started)} since start</Text>}
+          {lastLap !== undefined && (
+            <Text dimColor wrap="truncate-end">
+              Last turn {formatSeconds(lastLap)} · avg {formatSeconds(avgLap)}
+            </Text>
+          )}
+          {/* 上の行から描く。いちばん下の行に見出しを付け、丸のいる行はその列で区切って丸だけ薄くしない */}
+          {laps.length > 0 && (
+            <Box flexDirection="column">
+              {chart.map((row, i) => {
+                const label = i === STEP_ROWS ? 'Turns ' : '      '
+                const at = hopper?.level === STEP_ROWS - i ? hopper.column : -1
+                return at < 0 ? (
+                  <Text dimColor wrap="truncate-end">
+                    {label}
+                    {row}
+                  </Text>
+                ) : (
+                  <Text wrap="truncate-end">
+                    <Text dimColor>
+                      {label}
+                      {row.slice(0, at)}
+                    </Text>
+                    {HOPPER}
+                    <Text dimColor>{row.slice(at + 1)}</Text>
+                  </Text>
+                )
+              })}
             </Box>
           )}
           {/* 開くと /context と同じ内訳。手元の見積もりなので、上の使用率と合計は一致しないことがある */}

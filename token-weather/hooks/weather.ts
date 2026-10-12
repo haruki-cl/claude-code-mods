@@ -22,6 +22,21 @@ export function weatherFor(percent: number): Weather {
   return weather
 }
 
+/** ミリ秒を「42s」「1m 12s」「1h 2m」にする */
+export function formatSeconds(ms: number): string {
+  const seconds = Math.max(Math.round(ms / 1000), 0)
+  if (seconds < 60) {
+    return `${seconds}s`
+  }
+
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) {
+    return `${minutes}m ${seconds % 60}s`
+  }
+
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
 /** 使用量の枠（5 時間・週）の色。天気より早めに注意を促す */
 export function limitColor(percentUsed: number): string {
   if (percentUsed < 50) {
@@ -73,6 +88,50 @@ export function sparkline(values: readonly number[]): string {
   return values
     .map(v => SPARKS[Math.min(SPARKS.length - 1, Math.floor((Math.min(Math.max(v, 0), 100) / 100) * SPARKS.length))] ?? '')
     .join('')
+}
+
+// 段の上を跳ねる丸。棒のブロック文字と同じく 1 列で描かれる字にする
+export const HOPPER = '●'
+// 1 段を跳ぶのにかかるコマ数: 乗る、跳び上がる、次の段の上へ
+const HOP_FRAMES = 3
+
+/**
+ * 0〜100 の値の並びを、rows 行に積んだ棒の高さ（1/8 行単位）にする。最低でも 1。
+ * 最上段の 1/8 は空けておき、いちばん高い棒でも丸が上端の字に乗れるようにする
+ */
+export function stepHeights(values: readonly number[], rows: number): number[] {
+  const top = rows * 8 - 1
+  return values.map(v => 1 + Math.min(Math.floor((Math.min(Math.max(v, 0), 100) / 100) * top), top - 1))
+}
+
+/** 高さの並びを、上の行から順に rows 行の棒グラフにする。棒のない所は空白 */
+export function steps(heights: readonly number[], rows: number): string[] {
+  return Array.from({ length: rows }, (_, i) => {
+    const below = (rows - 1 - i) * 8
+    return heights.map(h => SPARKS[Math.min(h - below, 8) - 1] ?? ' ').join('')
+  })
+}
+
+/**
+ * frame コマ目に丸のいる列と、下から数えた行。棒の上端の字に重なり、満ちた字の上に立つ。
+ * 左から 1 段ずつ跳び、右端の外へ抜けたらまた左から。抜けているコマは undefined
+ */
+export function hopAt(heights: readonly number[], frame: number): { column: number; level: number } | undefined {
+  const stand = (i: number) => Math.floor((heights[i] ?? 0) / 8)
+  if (heights.length === 0) {
+    return undefined
+  }
+
+  const column = Math.floor(frame / HOP_FRAMES) % heights.length
+  const apex = Math.max(stand(column), stand(column + 1)) + 1
+  switch (frame % HOP_FRAMES) {
+    case 0:
+      return { column, level: stand(column) }
+    case 1:
+      return { column, level: apex }
+    default:
+      return column + 1 < heights.length ? { column: column + 1, level: apex } : undefined
+  }
 }
 
 const LIMIT_LABELS: Record<string, string> = {

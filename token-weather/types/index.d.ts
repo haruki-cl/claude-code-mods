@@ -41,6 +41,14 @@ declare module 'claude-code' {
       memory: Memory
       breakdown: Breakdown | null
       open: Open
+      // セッションが始まった時刻（再開なら最初の起動、/clear でやり直し）。まだ測っていなければ null
+      startedAt: number | null
+      // 1 分ごとに進む数。経過時間を描き直すためだけに使う
+      minute: number
+      // 各ターンにかかった時間（ミリ秒）。新しいものが末尾
+      turns: number[]
+      // Turns の段を跳ねる丸の何コマ目か。作業中だけ数え、作業していなければ null（丸は出さない）
+      hop: number | null
     }
   }
 }

@@ -3,7 +3,7 @@ import type { Mounted } from 'claude-code/testing'
 import type { On, SessionContextBreakdown, SessionContextUsage, SessionRateLimit } from 'claude-code'
 
 import { ageDaysIn, countEntries, formatAge, isMemoryIndex, loadedFilesIn, memoryFileName, memoryPathsIn, parseEntries, shorten, stem } from '../hooks/memory.ts'
-import { bar, formatLeft, formatReset, formatTokens, limitColor, padCells, percentOf, sparkline, weatherFor } from '../hooks/weather.ts'
+import { HOPPER, bar, formatLeft, formatReset, formatSeconds, formatTokens, hopAt, limitColor, padCells, percentOf, sparkline, stepHeights, steps, weatherFor } from '../hooks/weather.ts'
 
 const pane = (bodyColumns = 32) => ({
   title: 'Token Weather',
@@ -103,6 +103,11 @@ async function texts(ui: Mounted<'terminal', 'Pane'>): Promise<string[]> {
   return (await ui.findAll({ type: 'Text' })).map(t => t.text)
 }
 
+// Turns のグラフの行を上から。見出しか字下げの 6 列に、棒の本数ぶんの列が続く行だけを拾う（丸の前後で区切った断片は短いので落ちる）
+function turnRows(shown: string[], bars: number): string[] {
+  return shown.filter(t => t.length === 6 + bars && /^(Turns | {6})/.test(t))
+}
+
 describe('表示の部品', () => {
   test('使用率のしきい値で天気が変わる', () => {
     expect(weatherFor(24).label).toBe('Sunny')
@@ -123,12 +128,33 @@ describe('表示の部品', () => {
     expect(padCells('週の枠', 7)).toBe('週の枠 ')
   })
 
+  test('ターンの段と、その上を跳ねる丸', () => {
+    // 2 段に積む。最上段の 1/8 は、いちばん高い棒でも丸が乗れるように空ける
+    expect(stepHeights([0, 50, 100], 2)).toEqual([1, 8, 15])
+    expect(steps([4, 15, 8], 3)).toEqual(['   ', ' ▇ ', '▄██'])
+    // 棒の上端の字に重なって立ち、乗る、跳び上がる、次の段の上へ。右端の外へ抜けたら、また左の段から
+    expect(Array.from({ length: 10 }, (_, f) => hopAt([4, 15, 8], f))).toEqual([
+      { column: 0, level: 0 },
+      { column: 0, level: 2 },
+      { column: 1, level: 2 },
+      { column: 1, level: 1 },
+      { column: 1, level: 2 },
+      { column: 2, level: 2 },
+      { column: 2, level: 1 },
+      { column: 2, level: 2 },
+      undefined,
+      { column: 0, level: 0 },
+    ])
+    expect(hopAt([], 0)).toBeUndefined()
+  })
+
   test('残り時間と割合', () => {
     expect(formatLeft(2 * 3_600_000 + 13 * 60_000)).toBe('2h 13m')
     expect(formatLeft(3 * 86_400_000 + 5 * 3_600_000)).toBe('3d 5h')
     expect(formatLeft(12 * 60_000)).toBe('12m')
     expect(formatLeft(-1)).toBe('0m')
     expect([percentOf(72_000, 200_000), percentOf(1, 0)]).toEqual([36, 0])
+    expect([formatSeconds(42_000), formatSeconds(72_000), formatSeconds(3_720_000), formatSeconds(-5)]).toEqual(['42s', '1m 12s', '1h 2m', '0s'])
   })
 
   test('リセット時刻を日付・曜日・時刻にする', () => {
@@ -297,6 +323,141 @@ describe('サイドバー', () => {
 
     expect(shown).toContain('Index 2 entries')
     expect(memoryRows(shown)).toEqual([['*', '~/.claude/CLAUDE.md']])
+  })
+
+  test('起動してからの経過時間を出す', async ($, on) => {
+    // エンジンは startedAt: 0 を答えるので、いまが 65 分なら 1h 5m
+    mock.clock(on, { now: 65 * 60_000 })
+    engine(on)
+
+    await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    expect(await texts(ui)).toContain('⏱ 1h 5m since start')
+  })
+
+  test('ターンごとの所要時間と、その推移を出す', async ($, on) => {
+    mock.clock(on)
+    engine(on)
+    on('turn.complete', ($, e) => ({ text: e.answer }))
+
+    const done = (turnId: string, durationMs: number, agentId?: string) =>
+      $.turn.complete({ turnId, durationMs, answer: 'ok', isAborted: false, reason: 'answer', ...(agentId ? { agentId } : {}) } as never)
+    await done('t1', 18_000)
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    // 1 ターン目から棒 1 本で出す。作業していないので丸はいない
+    expect(turnRows(await texts(ui), 1)).toEqual(['       ', '      ▇', 'Turns █'])
+
+    await done('t2', 42_000)
+    // サブエージェントのターンは数えない
+    await done('t3', 600_000, 'sub-1')
+    const shown = await texts(ui)
+
+    expect(shown).toContain('Last turn 42s · avg 30s')
+    expect(turnRows(shown, 2)).toEqual(['        ', '       ▇', 'Turns ▇█'])
+  })
+
+  test('作業中だけ丸が Turns の段を左から跳んでいき、終わると消える', async ($, on) => {
+    const clock = mock.clock(on)
+    engine(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', ($, e) => ({ text: e.answer }))
+
+    const done = (turnId: string, durationMs: number, agentId?: string) =>
+      $.turn.complete({ turnId, durationMs, answer: 'ok', isAborted: false, reason: 'answer', ...(agentId ? { agentId } : {}) } as never)
+    // 低い、いちばん高い、中くらいの 3 本
+    await done('t1', 10_000)
+    await done('t2', 40_000)
+    await done('t3', 20_000)
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    // 丸のいる [上から何行目, 何列目の棒]。いなければ undefined
+    const at = async (bars: number) => {
+      const rows = turnRows(await texts(ui), bars)
+      const row = rows.findIndex(r => r.includes(HOPPER))
+      return row < 0 ? undefined : [row, (rows[row] ?? '').indexOf(HOPPER) - 6]
+    }
+    // 作業していないあいだは丸を出さない
+    expect(await at(3)).toBeUndefined()
+
+    await $.turn.start({ text: 'hi', turnId: 't4' })
+    const path = [await at(3)]
+    for (let i = 0; i < 9; i++) {
+      await clock.advance(120)
+      path.push(await at(3))
+    }
+    // 乗る、跳び上がる、次の段の上へ。右端の外へ抜けたら、また左の段から
+    expect(path).toEqual([[2, 0], [0, 0], [0, 1], [1, 1], [0, 1], [0, 2], [1, 2], [0, 2], undefined, [2, 0]])
+
+    // サブエージェントのターンが終わっても跳び続ける
+    await done('sub', 1_000, 'sub-1')
+    await clock.advance(120)
+    expect(await at(3)).toEqual([0, 0])
+
+    // メインのターンが終わると丸は消え、時間が経っても出てこない
+    await done('t4', 40_000)
+    expect(turnRows(await texts(ui), 4)).toEqual(['          ', '       ▇ ▇', 'Turns ▄███'])
+    await clock.advance(1_000)
+    expect(await at(4)).toBeUndefined()
+  })
+
+  test('枠は、状態が空なら変化なしの応答からも取り込み、読みのない測り直しでは消えない', async ($, on) => {
+    mock.clock(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    // 測り直しは枠の読みを返さないエンジン
+    on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000 }, rateLimits: [] } }))
+    on('agent.list', () => ({ value: [] }))
+    on('tool.call', { tool: 'Bash' }, () => ({ ref: 1, text: 'ok', result: { stdout: 'ok', stderr: '', interrupted: false } }))
+
+    // 枠に変化はない（changed に rateLimits がない）が、まだ何も持っていないので取り込む
+    await $.session.measure({ context: { tokens: 10_000, window: 200_000, percent: 5 }, rateLimits: LIMITS, changed: ['context'] } as never)
+    // ツール呼び出しの測り直しは枠を返さないが、持っている枠は残る
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    expect(await texts(ui)).toContain('Usage limits')
+  })
+
+  test('推移・ターン時間・読んだメモリは $.store に写される', async ($, on) => {
+    mock.clock(on, { now: 1_000 })
+    engine(on)
+    tools(on)
+    on('session.id', () => ({ value: 's1' }))
+    on('turn.complete', ($, e) => ({ text: e.answer }))
+    // テストの $ には store がないので、書かれたものを自前で受け止める
+    const saved: Record<string, unknown> = {}
+    on('store.get', ($, e) => ({ value: saved[e.key] }))
+    on('store.set', ($, e) => {
+      saved[e.key] = e.value
+      return { value: undefined }
+    })
+    on('store.keys', () => ({ value: Object.keys(saved) }))
+
+    await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
+    await measure($, { tokens: 12_000, window: 200_000, percent: 6 })
+    await $.turn.complete({ turnId: 't1', durationMs: 18_000, answer: 'ok', isAborted: false, reason: 'answer' } as never)
+    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md` })
+
+    expect(saved['series:s1']).toMatchObject({ history: [5, 6], turns: [18_000], reads: [{ name: 'a', how: 'tool', ageDays: 48 }], savedAt: 1_000 })
+  })
+
+  test('再読み込みで状態が空になっても、起動時に $.store から戻る', async ($, on) => {
+    mock.clock(on)
+    mock.store(on, {
+      'series:s0': { savedAt: 1, history: [1], turns: [], reads: [] },
+      'series:s1': { savedAt: 2, history: [20, 50, 88], turns: [18_000, 42_000], reads: [{ name: 'a', path: `${MEMORY_DIR}/a.md`, at: 2, how: 'tool', ageDays: 48 }] },
+    })
+    // 起動時の測り直しで使用量が入り、天気カードが描かれる
+    engine(on, { tokens: 20_000, window: 200_000, percent: 10 })
+    on('session.id', () => ({ value: 's1' }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('command.register', () => ({ value: { command: 'weather' } }))
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const shown = await texts(ui)
+
+    expect(shown).toContain('Trend ▂▅█')
+    expect(shown).toContain('Last turn 42s · avg 30s')
+    expect(memoryRows(shown)).toEqual([['', 'a', '48d']])
   })
 
   test('索引がないプロジェクトでは、ないと言う', async ($, on) => {
