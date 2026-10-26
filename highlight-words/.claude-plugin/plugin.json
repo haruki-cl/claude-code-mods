@@ -1,0 +1,9 @@
+{
+  "name": "highlight-words",
+  "version": "0.1.0",
+  "description": "Claude の応答から Haiku が重要な語句と確認が必要な語句を選び、ピンクとオレンジで描く（Dracula の配色）",
+  "author": {
+    "name": "haruki-cl"
+  },
+  "types": "./types/index.d.ts"
+}
