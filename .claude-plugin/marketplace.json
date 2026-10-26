@@ -1,6 +1,6 @@
 {
   "name": "claude-code-mods",
-  "description": "Claude Code の mod 集。token-weather（コンテキスト使用量と読んだメモリを右ペインに表示）、run-cat（考えている間に走る猫）、highlight-words（応答の重要な語句と要確認の語句に色を付ける）",
+  "description": "Claude Code の mod 集。token-weather（コンテキスト使用量と作業ログを右ペインに表示、/nippo で日報の下書き）、run-cat（考えている間に走る猫）、highlight-words（応答の重要な語句と要確認の語句に色を付ける）",
   "owner": {
     "name": "haruki-cl"
   },

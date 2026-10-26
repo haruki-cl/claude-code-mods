@@ -1,30 +1,40 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { EngineInterface, Register, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
 
-import type { Card, IndexEntry, Limit, MemoryIndex, MemoryRead, Usage } from '../types'
-import { ageDaysIn, formatAge, isMemoryIndex, loadedFilesIn, memoryFileName, memoryPathsIn, parseEntries, shorten, stem } from './memory.ts'
+import type { Card, Limit, LogEntry, Usage } from '../types'
+import { LOG_SYSTEM, RECAP_SYSTEM, cleanEntry, dayKey, formatClock, isLog, logPrompt, plainRecap, projectName, recapPrompt } from './log.ts'
+import type { Turn } from './log.ts'
 import { HOPPER, bar, formatLeft, formatReset, formatSeconds, formatTokens, hopAt, limitColor, limitLabel, limitOrder, padCells, percentOf, sparkline, stepHeights, steps, weatherFor } from './weather.ts'
 
 const PANE = 'token-weather'
 const TITLE = 'Token Weather'
 const COMMAND = 'weather'
+// /recap は Claude Code にもともとあるので、日報の下書きは /nippo で作る
+const RECAP = 'nippo'
 // 全画面表示のときにサイドバーとして欲しい幅
 const PANE_COLUMNS = 32
 // 推移グラフに残すターン数
 const HISTORY = 40
-// 読んだメモリのうち、覚えておく数と見せる数
-const READS_KEPT = 30
-const READS_SHOWN = 8
-// 起動直後は CLAUDE.md や MEMORY.md がまだ読み込まれていないことがあるので、少し待ってから内訳を取り直す
+// 作業ログのうち、このセッションで覚えておく数と、畳んでいるときに見せる数
+const LOG_KEPT = 50
+const LOG_SHOWN = 5
+// 作業ログと日報の下書きを書かせるモデル
+const LOG_MODEL = 'haiku'
+// ツールを呼ばず、応答もこれより短いターン（お礼や相づち）は作業ログに書かない
+const LOG_MIN_ANSWER = 80
+// 日報用に作業ログを残す日数
+const LOG_DAYS_KEPT = 14
+const DAY_MS = 86_400_000
+// 起動直後は内訳がまだそろっていないことがあるので、少し待ってから取り直す
 const LATE_REFRESH_MS = [3_000, 10_000]
 
 const usage = atom({ plugin: 'token-weather', key: 'usage' } as const, null)
 const history = atom({ plugin: 'token-weather', key: 'history' } as const, [])
 const limits = atom({ plugin: 'token-weather', key: 'limits' } as const, [])
 const autoCompactAt = atom({ plugin: 'token-weather', key: 'autoCompactAt' } as const, null)
-const memory = atom({ plugin: 'token-weather', key: 'memory' } as const, { index: null, reads: [] })
+const log = atom({ plugin: 'token-weather', key: 'log' } as const, [])
 const breakdown = atom({ plugin: 'token-weather', key: 'breakdown' } as const, null)
-const open = atom({ plugin: 'token-weather', key: 'open' } as const, { weather: false, limits: false, memory: false })
+const open = atom({ plugin: 'token-weather', key: 'open' } as const, { weather: false, limits: false, log: false })
 const startedAt = atom({ plugin: 'token-weather', key: 'startedAt' } as const, null)
 const minute = atom({ plugin: 'token-weather', key: 'minute' } as const, 0)
 const turns = atom({ plugin: 'token-weather', key: 'turns' } as const, [])
@@ -35,19 +45,17 @@ const MINUTE_MS = 60_000
 // Turns の段を跳ねる丸を 1 コマ進める間隔と、棒を積む段数（その上に跳ぶための 1 行を空ける）
 const HOP_MS = 120
 const STEP_ROWS = 2
-// 蓄積した値（推移・ターン時間・読んだメモリ）は $.store にも写し、再読み込みや --resume のあとに戻す。残すセッション数
+// 蓄積した値（推移・ターン時間）は $.store にも写し、再読み込みや --resume のあとに戻す。残すセッション数
 const SERIES_KEPT = 20
 
-type Series = { savedAt: number; history: number[]; turns: number[]; reads: MemoryRead[] }
+type Series = { savedAt: number; history: number[]; turns: number[] }
 
 const seriesKey = (sessionId: string) => `series:${sessionId}`
+// 日報用の作業ログの控え。日付とセッションごとに分けるので、同時に動く別のセッションと書き込みがぶつからない
+const logKey = (day: string, sessionId: string) => `log:${day}:${sessionId}`
 
 function isNumbers(x: unknown): x is number[] {
   return Array.isArray(x) && x.every(n => typeof n === 'number')
-}
-
-function isReads(x: unknown): x is MemoryRead[] {
-  return Array.isArray(x) && x.every(r => typeof r === 'object' && r !== null && typeof (r as MemoryRead).name === 'string' && typeof (r as MemoryRead).path === 'string')
 }
 
 // 変わった系列だけ上書きして保存する
@@ -55,7 +63,7 @@ async function saveSeries($: EngineInterface, changed: Partial<Omit<Series, 'sav
   try {
     const key = seriesKey(await $.session.id())
     const prev = ((await $.store.get(key)) ?? {}) as Partial<Series>
-    await $.store.set(key, { history: [], turns: [], reads: [], ...prev, ...changed, savedAt: await $.clock.now() })
+    await $.store.set(key, { history: prev.history ?? [], turns: prev.turns ?? [], ...changed, savedAt: await $.clock.now() })
   } catch {
     // 保存できなくても表示は続ける
   }
@@ -76,17 +84,43 @@ async function restoreSeries($: EngineInterface): Promise<void> {
       await update($, turns, prev => (prev.length > 0 ? prev : t))
     }
 
-    if (isReads(saved.reads)) {
-      const r = saved.reads
-      await update($, memory, m => (m.reads.length > 0 ? m : { ...m, reads: r }))
-    }
-
     const keys = (await $.store.keys()).filter(k => k.startsWith('series:') && k !== key)
     for (const old of keys.slice(0, Math.max(keys.length + 1 - SERIES_KEPT, 0))) {
       await $.store.delete(old)
     }
   } catch {
     // 戻せなくても、ここから貯め直せばよい
+  }
+}
+
+// 状態が空なら、このセッションの作業ログを日報用の控えから戻す。残す日数を過ぎた控えは消す
+async function restoreLog($: EngineInterface): Promise<void> {
+  try {
+    const id = await $.session.id()
+    const cutoff = dayKey((await $.clock.now()) - LOG_DAYS_KEPT * DAY_MS)
+    const mine: LogEntry[] = []
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith('log:')) {
+        continue
+      }
+
+      // log:2026-10-27:<セッション> の日付の部分
+      if (key.slice(4, 14) < cutoff) {
+        await $.store.delete(key)
+      } else if (key.endsWith(`:${id}`)) {
+        const saved = await $.store.get(key)
+        if (isLog(saved)) {
+          mine.push(...saved)
+        }
+      }
+    }
+
+    if (mine.length > 0) {
+      const restored = mine.sort((a, b) => a.at - b.at).slice(-LOG_KEPT)
+      await update($, log, prev => (prev.length > 0 ? prev : restored))
+    }
+  } catch {
+    // 戻せなくても、ここから書き足せばよい
   }
 }
 
@@ -105,99 +139,13 @@ function toLimits(rateLimits: readonly SessionRateLimit[]): Limit[] {
     .sort((a, b) => limitOrder(a.kind) - limitOrder(b.kind))
 }
 
-// 索引の項目は、パスとトークン数が変わらないかぎり読み直さない
-let counted: { path: string; tokens?: number; entries?: IndexEntry[] } | undefined
-
-async function describeIndex($: EngineInterface, path: string, tokens?: number): Promise<MemoryIndex> {
-  if (counted?.path !== path || counted.tokens !== tokens) {
-    let entries: IndexEntry[] | undefined
-    try {
-      entries = parseEntries(await $.fs.read(path))
-    } catch {
-      entries = undefined
-    }
-
-    counted = { path, ...(tokens !== undefined ? { tokens } : {}), ...(entries !== undefined ? { entries } : {}) }
-  }
-
-  return { path, ...(tokens !== undefined ? { tokens } : {}), ...(counted.entries !== undefined ? { entries: counted.entries } : {}) }
-}
-
-// 索引が載ったと分かったら覚える。トークン数は内訳から分かったときだけ更新し、一度載った索引は /clear まで消さない
-async function noteIndex($: EngineInterface, path: string, tokens?: number): Promise<void> {
-  const index = await describeIndex($, path, tokens)
-  await update($, memory, m => ({ ...m, index: { ...index, ...(index.tokens === undefined && m.index?.tokens !== undefined ? { tokens: m.index.tokens } : {}) } }))
-}
-
-// 内訳から、自動圧縮のしきい値と、カテゴリごとの行と、エンジンが数える memory files（CLAUDE.md 群と MEMORY.md）を取り出す
+// 内訳から、自動圧縮のしきい値と、カテゴリごとの行を取り出す
 async function absorb($: EngineInterface, b: SessionContextBreakdown): Promise<void> {
   await update($, autoCompactAt, () => (b.isAutoCompactEnabled && b.autoCompactThreshold ? b.autoCompactThreshold : null))
   await update($, breakdown, () => ({
     categories: b.categories.flatMap(c => (c.kind === 'deferred' ? [] : [{ name: c.name, tokens: c.tokens, kind: c.kind }])),
     window: b.rawMaxTokens,
   }))
-
-  const others = b.memoryFiles.filter(f => f.type !== 'AutoMem')
-  const root = others.length > 0 ? await $.session.root() : undefined
-  const home = others.length > 0 ? await $.env.get('HOME') : undefined
-  for (const f of b.memoryFiles) {
-    if (f.type === 'AutoMem') {
-      await noteIndex($, f.path, f.tokens)
-    } else {
-      // 応答のたびに来るので、載っているものは並びを動かさない
-      await remember($, { name: shorten(f.path, root, home), path: f.path, how: 'auto' }, { keep: true })
-    }
-  }
-}
-
-// 読んだものとして覚える。同じファイルは 1 件だけ残し、読み直したら最新に上げる（keep なら動かさない）
-async function remember($: EngineInterface, read: Omit<MemoryRead, 'at'>, options?: { keep: boolean }): Promise<void> {
-  const at = await $.clock.now()
-  const next = await update($, memory, m => {
-    if (options?.keep && m.reads.some(r => r.path === read.path)) {
-      return m
-    }
-
-    return { ...m, reads: [...m.reads.filter(r => r.path !== read.path), { ...read, at }].slice(-READS_KEPT) }
-  })
-  await saveSeries($, { reads: next.reads })
-}
-
-// サブエージェントでもチームメイトでもないループは、エンジン自身のもの（compaction やメモリ処理）
-async function isEngineLoop($: EngineInterface, agentId: string | undefined): Promise<boolean> {
-  if (agentId === undefined) {
-    return false
-  }
-
-  try {
-    return !(await $.agent.list()).some(a => a.id === agentId)
-  } catch {
-    return false
-  }
-}
-
-// エンジンが注入した文章に指示ファイルやメモリが含まれていたら、勝手に読まれたものとして覚える
-async function noteInjected($: EngineInterface, text: string): Promise<void> {
-  const files = loadedFilesIn(text)
-  const root = files.length > 0 ? await $.session.root() : undefined
-  const home = files.length > 0 ? await $.env.get('HOME') : undefined
-  for (const f of files) {
-    if (isMemoryIndex(f.path)) {
-      await noteIndex($, f.path)
-      continue
-    }
-
-    const name = memoryFileName(f.path)
-    await remember($, { name: name ? stem(name) : shorten(f.path, root, home), path: f.path, how: 'auto' })
-  }
-
-  // 見出しなしで本文に現れたメモリ（想起）も拾う
-  for (const path of memoryPathsIn(text)) {
-    const name = memoryFileName(path)
-    if (name && !files.some(f => f.path === path)) {
-      await remember($, { name: stem(name), path, how: 'auto' })
-    }
-  }
 }
 
 // 使用量と枠を測り直す。内訳は手元での見積もりなので API 呼び出しは発生しない
@@ -214,25 +162,51 @@ async function refresh($: EngineInterface, withBreakdown: boolean): Promise<void
   }
 }
 
-// Read か Bash でメモリファイルを読んでいたら、読んだものとして覚える。エンジン自身のループが読んだものは auto
-async function noteMemoryRead($: EngineInterface, e: ToolCallInput, result: ToolCallResult): Promise<void> {
-  if (result.deny !== undefined || result.isError) {
-    return
-  }
+// 1 ターンぶんの作業を Haiku に 1 行にまとめさせ、ペインと日報用の控えに足す。書けなかったときは理由をデバッグログに残すだけにする
+async function writeLog($: EngineInterface, turn: Turn): Promise<void> {
+  try {
+    const result = await $.model.complete({ model: LOG_MODEL, system: LOG_SYSTEM, prompt: logPrompt(turn), maxTokens: 200 })
+    if (!result.isAnswered) {
+      $.ui.log(`作業ログを書けませんでした（${result.reason}）`, { to: 'debug' })
+      return
+    }
 
-  const paths = e.tool === 'Read' ? [e.file_path] : e.tool === 'Bash' ? memoryPathsIn(e.command) : []
-  if (paths.length === 0) {
-    return
-  }
+    const text = cleanEntry(result.text)
+    if (text === '') {
+      return
+    }
 
-  const ageDays = ageDaysIn(result.text)
-  const how = (await isEngineLoop($, e.agentId)) ? 'auto' : 'tool'
-  for (const path of paths) {
-    const name = memoryFileName(path)
-    if (name) {
-      await remember($, { name: stem(name), path, how, ...(ageDays !== undefined ? { ageDays } : {}) })
+    const entry: LogEntry = { at: turn.at, project: projectName(await $.session.root()), text }
+    await update($, log, list => [...list, entry].slice(-LOG_KEPT))
+    const key = logKey(dayKey(turn.at), await $.session.id())
+    const saved = await $.store.get(key)
+    await $.store.set(key, [...(isLog(saved) ? saved : []), entry])
+  } catch (error) {
+    $.ui.log(`作業ログを書けませんでした（${String(error)}）`, { to: 'debug' })
+  }
+}
+
+// 今日の作業ログ（この PC で動いたすべてのセッションの分）から、Haiku に日報の下書きを書かせる
+async function recap($: EngineInterface): Promise<string> {
+  const today = dayKey(await $.clock.now())
+  const entries: LogEntry[] = []
+  for (const key of await $.store.keys()) {
+    if (key.startsWith(`log:${today}:`)) {
+      const saved = await $.store.get(key)
+      if (isLog(saved)) {
+        entries.push(...saved)
+      }
     }
   }
+
+  if (entries.length === 0) {
+    return 'No work logged today yet.'
+  }
+
+  entries.sort((a, b) => a.at - b.at)
+  const result = await $.model.complete({ model: LOG_MODEL, system: RECAP_SYSTEM, prompt: recapPrompt(entries), maxTokens: 1024 })
+  const body = result.isAnswered && result.text.trim() !== '' ? result.text.trim() : plainRecap(entries)
+  return `## ${today}\n\n${body}`
 }
 
 async function toggle($: EngineInterface): Promise<string> {
@@ -249,10 +223,18 @@ async function toggle($: EngineInterface): Promise<string> {
 export const register: Register = on => {
   // Turns の段を跳ねる丸のタイマー。メインのターンのあいだだけ動かす
   let hopping: Timer | undefined
+  // 作業ログの材料。メインのターンが始まるたびに取り直す
+  let prompt = ''
+  let called: string[] = []
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: COMMAND, description: 'Open or close Token Weather (context usage as weather) on the right', immediate: true })
+    // 名前がほかのコマンドとぶつかって断られても、天気と作業ログは動かす
+    await $.command.register({ name: RECAP, description: "Draft today's daily report from the Token Weather work log" }).catch(error => {
+      $.ui.log(`/${RECAP} を登録できませんでした（${String(error)}）`, { to: 'debug' })
+    })
     await restoreSeries($)
+    await restoreLog($)
     // ターンの途中で再読み込みされるとタイマーは消えるので、宙に浮いたまま止めずに消す
     await update($, hop, () => null)
     await refresh($, true)
@@ -269,8 +251,13 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // プロンプトが送られた時点でも取り直す。最初の応答を待たずに、起動時に載った memory files を出すため
+  // プロンプトが送られた時点でも取り直す。最初の応答を待たずに天気を出すため
   on('turn.start', async ($, e, next) => {
+    if (!e.agentId) {
+      prompt = e.text
+      called = []
+    }
+
     // 作業中は、丸が Turns の段を左から跳んでいく。止めたあとに遅れて来たコマでは動かさない
     if (!hopping) {
       await update($, hop, () => 0)
@@ -282,6 +269,8 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: COMMAND }, async $ => ({ text: await toggle($) }))
+
+  on('command.run', { command: RECAP }, async $ => ({ text: await recap($) }))
 
   // 応答のたびに Claude Code が使用量を知らせてくる
   on('session.measure', async ($, e, next) => {
@@ -307,7 +296,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // ターンが終わるたびに、かかった時間を控える（サブエージェントのターンは除く）。丸は止めて消す
+  // ターンが終わるたびに、かかった時間を控え、作業ログを書かせる（サブエージェントのターンは除く）。丸は止めて消す
   on('turn.complete', async ($, e, next) => {
     if (!e.agentId) {
       hopping?.cancel()
@@ -315,35 +304,37 @@ export const register: Register = on => {
       await update($, hop, () => null)
       const t = await update($, turns, list => [...list, e.durationMs].slice(-HISTORY))
       await saveSeries($, { turns: t })
+
+      // ターンの終わりを待たせないよう、作業ログはタイマーに回して書かせる
+      const isWork = called.length > 0 || e.answer.trim().length >= LOG_MIN_ANSWER
+      if (e.reason === 'answer' && isWork) {
+        const turn: Turn = { at: await $.clock.now(), prompt, tools: [...called], answer: e.answer }
+        $.clock.after(0, () => void writeLog($, turn))
+      }
     }
 
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // 長い作業の途中でも天気が変わるように、ツールを呼ぶたびにも測り直す。メモリを読んでいればそれも控える
+  // 長い作業の途中でも天気が変わるように、ツールを呼ぶたびにも測り直す。メインのループが呼んだツールは作業ログの材料に控える
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
-    await noteMemoryRead($, e, result)
     if (!e.agentId) {
+      called.push(String(e.tool))
       await refresh($, false)
     }
 
     return result
   }).catch(($, e, next) => next(e))
 
-  // エンジンがモデルに向けて勝手に差し込む文章（起動時の CLAUDE.md と MEMORY.md、ディレクトリに触れたときの CLAUDE.md、想起）
-  on('prompt.attachment', async ($, e, next) => {
-    await noteInjected($, e.text)
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
   on('session.end', async ($, e, next) => {
+    // 日報用の控えは残し、このセッションの表示だけ空にする
     if (e.reason === 'clear') {
       await $.store.delete(seriesKey(e.sessionId)).catch(() => undefined)
       await update($, usage, () => null)
       await update($, history, () => [])
       await update($, autoCompactAt, () => null)
-      await update($, memory, () => ({ index: null, reads: [] }))
+      await update($, log, () => [])
       await update($, breakdown, () => null)
       await update($, startedAt, () => null)
       await update($, turns, () => [])
@@ -358,7 +349,7 @@ export const register: Register = on => {
     const trend = await read($, history)
     const windows = await read($, limits)
     const compactAt = await read($, autoCompactAt)
-    const mem = await read($, memory)
+    const entries = await read($, log)
     const parts = await read($, breakdown)
     const opened = await read($, open)
     const started = await read($, startedAt)
@@ -372,8 +363,6 @@ export const register: Register = on => {
     const inner = Math.max(12, e.props.bodyColumns - 4)
     // 枠の名前（7 列）と使用率（5 列）、空白 1 列のあとに残る幅をバーにする
     const limitBar = Math.max(inner - 13, 4)
-    // 印 2 列、メモリの名前、空白 1 列、日数 4 列
-    const memoryName = Math.max(inner - 7, 6)
     // 内訳の行: カテゴリ名、空白 1 列、トークン数 5 列、空白 1 列、割合 4 列
     const categoryName = Math.max(inner - 11, 6)
 
@@ -383,10 +372,9 @@ export const register: Register = on => {
 
     const weather = u ? weatherFor(u.percent) : undefined
     const untilCompact = u && compactAt ? Math.max(compactAt - u.tokens, 0) : undefined
-    // 新しく読んだものを上に。開いていれば全部、畳んでいれば上から数件
-    const recent = [...mem.reads].reverse().slice(0, opened.memory ? mem.reads.length : READS_SHOWN)
-    const hidden = mem.reads.length - recent.length
-    const hasAuto = recent.some(r => r.how === 'auto')
+    // 作業ログは新しいものを上に。開いていれば全部を時刻つきで折り返し、畳んでいれば上から数件を 1 行ずつ
+    const shownLog = [...entries].reverse().slice(0, opened.log ? entries.length : LOG_SHOWN)
+    const hiddenLog = entries.length - shownLog.length
     // ターンの所要時間: 直近と平均、推移は最長を 100% として段に積み、その上を丸が跳ねる
     const lastLap = laps.at(-1)
     const avgLap = laps.length > 0 ? laps.reduce((a, b) => a + b, 0) / laps.length : 0
@@ -516,38 +504,23 @@ export const register: Register = on => {
         )}
 
         <Box borderStyle="round" borderColor="magenta" paddingX={1} flexDirection="column">
-          <Button key="memory" plain onPress={toggle('memory')}>
-            <Text bold>🧠 Memory</Text> <Text dimColor>{mark('memory')}</Text>
+          <Button key="log" plain onPress={toggle('log')}>
+            <Text bold>📝 Work log</Text> <Text dimColor>{mark('log')}</Text>
           </Button>
-          {mem.index ? (
-            <Box justifyContent="space-between">
-              <Text wrap="truncate-end">Index {mem.index.entries !== undefined ? `${mem.index.entries.length} entries` : 'loaded'}</Text>
-              {mem.index.tokens !== undefined && <Text dimColor>{formatTokens(mem.index.tokens)}</Text>}
-            </Box>
-          ) : (
-            <Text dimColor>Index not in context</Text>
-          )}
-          {/* 開くと、索引に並ぶ項目の名前 */}
-          {opened.memory &&
-            mem.index?.entries?.map(entry => (
-              <Text dimColor wrap="truncate-end">
-                {'  · '}
-                {entry.title}
-              </Text>
-            ))}
-          {opened.memory && recent.length > 0 && <Text dimColor>Read this session</Text>}
-          {recent.length === 0 ? (
-            <Text dimColor>No memory file read yet</Text>
-          ) : (
-            recent.map(r => (
-              <Text wrap="truncate-end">
-                {r.how === 'auto' ? '* ' : '  '}
-                {padCells(r.name.slice(0, memoryName), memoryName)} <Text dimColor>{formatAge(r.ageDays).padStart(4)}</Text>
+          {shownLog.length === 0 ? (
+            <Text dimColor>No turn logged yet</Text>
+          ) : opened.log ? (
+            shownLog.map(entry => (
+              <Text>
+                <Text dimColor>{formatClock(entry.at)}</Text> {entry.text}
               </Text>
             ))
+          ) : (
+            shownLog.map(entry => <Text wrap="truncate-end">{entry.text}</Text>)
           )}
-          {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
-          {hasAuto && <Text dimColor>* loaded by the engine</Text>}
+          {hiddenLog > 0 && <Text dimColor>+{hiddenLog} more</Text>}
+          {/* 開くと、日報の下書きの作り方 */}
+          {opened.log && <Text dimColor>/{RECAP} drafts today's report</Text>}
         </Box>
       </Box>
     )

@@ -1,8 +1,9 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { Mounted } from 'claude-code/testing'
+import type { Engine, Mounted } from 'claude-code/testing'
 import type { On, SessionContextBreakdown, SessionContextUsage, SessionRateLimit } from 'claude-code'
 
-import { ageDaysIn, countEntries, formatAge, isMemoryIndex, loadedFilesIn, memoryFileName, memoryPathsIn, parseEntries, shorten, stem } from '../hooks/memory.ts'
+import type { LogEntry } from '../types'
+import { cleanEntry, countTools, dayKey, formatClock, logPrompt, plainRecap, projectName, recapPrompt } from '../hooks/log.ts'
 import { HOPPER, bar, formatLeft, formatReset, formatSeconds, formatTokens, hopAt, limitColor, padCells, percentOf, sparkline, stepHeights, steps, weatherFor } from '../hooks/weather.ts'
 
 const pane = (bodyColumns = 32) => ({
@@ -19,43 +20,22 @@ const LIMITS: SessionRateLimit[] = [
   { kind: 'five_hour', percentUsed: 2, resetsAt: '2026-10-07T18:10:00Z' },
 ]
 
-// auto-memory のディレクトリと、そこに置かれた索引
-const MEMORY_DIR = '/Users/me/.claude/projects/-Users-me-app/memory'
-const INDEX_PATH = `${MEMORY_DIR}/MEMORY.md`
-const INDEX_TEXT = ['# Memory index', '', '- [Flow HTML structure](flow-html-structure.md) — sections and ids', '- [Intern materials](intern-materials.md) — audience'].join('\n')
-const AGE_NOTE = '<system-reminder>This memory is 48 days old. Memories are point-in-time observations, not live state.</system-reminder>\n'
-const HOME = '/Users/me'
 const ROOT = '/Users/me/app'
-// 起動時にエンジンが差し込む、CLAUDE.md と索引をまとめた文章
-const INSTRUCTIONS = [
-  `Contents of ${HOME}/.claude/CLAUDE.md (user's private global instructions for all projects):`,
-  '',
-  '# 禁止事項',
-  '',
-  `Contents of ${ROOT}/.claude/CLAUDE.md (project instructions, checked into the codebase):`,
-  '',
-  '# Project',
-  '',
-  `Contents of ${INDEX_PATH} (user's auto-memory, persists across conversations):`,
-  '',
-  INDEX_TEXT,
-].join('\n')
+// この PC の時刻で 2026-10-27 の昼
+const NOON = new Date(2026, 9, 27, 12, 0).getTime()
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+// ツールを呼ばないターンでも作業ログに書かれる長さの応答
+const LONG_ANSWER = '説明します。'.repeat(20)
 
 const BREAKDOWN = {
   categories: [
     { name: 'Messages', tokens: 72_000, color: 'x', isDeferred: false, kind: 'used' },
     { name: 'Free space', tokens: 90_000, color: 'x', isDeferred: false, kind: 'free' },
   ],
-  memoryFiles: [{ path: INDEX_PATH, type: 'AutoMem', tokens: 300 }],
+  memoryFiles: [],
   isAutoCompactEnabled: true,
   autoCompactThreshold: 160_000,
   rawMaxTokens: 200_000,
-} as unknown as SessionContextBreakdown
-
-// エンジンが memory files に CLAUDE.md も数えているときの内訳
-const WITH_CLAUDE_MD = {
-  ...BREAKDOWN,
-  memoryFiles: [{ path: `${HOME}/.claude/CLAUDE.md`, type: 'User', tokens: 200 }, ...BREAKDOWN.memoryFiles],
 } as unknown as SessionContextBreakdown
 
 // Claude Code が応答のあとに使用量を知らせてくるのと同じ呼び方
@@ -63,40 +43,64 @@ async function measure($: { session: { measure: (e: never) => Promise<unknown> }
   await $.session.measure({ context, rateLimits, changed: ['context', 'rateLimits'] } as never)
 }
 
-// 内訳つきの使用量を答え、索引を読ませ、エージェントは一つもいないエンジンの代わり
-const engine = (on: On, context: SessionContextUsage = { window: 200_000 }, breakdown: SessionContextBreakdown = BREAKDOWN) => {
+// 内訳つきの使用量とセッションのルートを答えるエンジンの代わり
+const engine = (on: On, context: SessionContextUsage = { window: 200_000 }) => {
   on('session.measure', ($, e) => ({ changed: e.changed }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { ...context, breakdown }, rateLimits: LIMITS } }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { ...context, breakdown: BREAKDOWN }, rateLimits: LIMITS } }))
   on('session.root', () => ({ value: ROOT }))
-  on('fs.read', () => ({ value: INDEX_TEXT }))
-  on('agent.list', () => ({ value: [] }))
-  on('prompt.attachment', ($, e) => ({ text: e.text }))
-  mock.env(on, { HOME })
+  on('session.id', () => ({ value: 's1' }))
 }
 
-// エンジンがモデルに向けて文章を差し込むのと同じ呼び方
-async function inject($: { prompt: { attachment: (e: never) => Promise<unknown> } }, type: string, text: string) {
-  await $.prompt.attachment({ type, text } as never)
-}
-
-// メモリの行だけを取り出し、印・名前・日数に分ける。枠の使用率の行（「  36% █…」）、索引の項目（「  · …」）と凡例は除く
-function memoryRows(shown: string[]): string[][] {
-  return shown
-    .filter(t => /^(\* |  )[^\d\s·]/.test(t) && !t.startsWith('  resets') && t !== '* loaded by the engine')
-    .map(t => [t.startsWith('* ') ? '*' : '', ...t.slice(2).trim().split(/\s+/)])
-}
-
-// Read と Bash を、エンジンがメモリファイルに付ける注意書きごと真似る
 const tools = (on: On) => {
-  on('tool.call', { tool: 'Read' }, ($, e) => {
-    const isMemory = e.file_path.startsWith(MEMORY_DIR)
-    return {
-      ref: 1,
-      text: `${isMemory ? AGE_NOTE : ''}1\t---`,
-      result: { type: 'text' as const, file: { filePath: e.file_path, content: '---', numLines: 1, startLine: 1, totalLines: 1 } },
-    }
-  })
+  on('tool.call', { tool: 'Read' }, ($, e) => ({
+    ref: 1,
+    text: '1\t---',
+    result: { type: 'text' as const, file: { filePath: e.file_path, content: '---', numLines: 1, startLine: 1, totalLines: 1 } },
+  }))
   on('tool.call', { tool: 'Bash' }, () => ({ ref: 1, text: 'ok', result: { stdout: 'ok', stderr: '', interrupted: false } }))
+}
+
+// ターンの始まりと終わりを受け止めるエンジンの代わり
+const loop = (on: On) => {
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+}
+
+// Haiku の代わり。reply を答え、受け取った依頼を控える
+function haiku(on: On, reply: (prompt: string) => string): { prompts: string[] } {
+  const seen = { prompts: [] as string[] }
+  on('model.complete', ($, e) => {
+    seen.prompts.push(e.prompt)
+    return { value: { isAnswered: true as const, text: reply(e.prompt), usage: USAGE } }
+  })
+  return seen
+}
+
+// メインのターンを 1 回まわす。依頼を送り、ツールを呼び、答えて終わる
+async function work($: Engine, turnId: string, text: string, answer: string, run: (() => Promise<unknown>)[] = []) {
+  await $.turn.start({ text, turnId })
+  for (const call of run) {
+    await call()
+  }
+  await $.turn.complete({ turnId, durationMs: 1_000, answer, isAborted: false, reason: 'answer' } as never)
+}
+
+const entry = (at: number, text: string, project = 'app'): LogEntry => ({ at, project, text })
+
+// テストの $ には store がないので、書かれたものを自前で受け止める。中身はこの Record で読む
+function store(on: On, initial: Record<string, unknown> = {}): Record<string, unknown> {
+  const saved: Record<string, unknown> = { ...initial }
+  on('store.get', ($, e) => ({ value: saved[e.key] }))
+  on('store.set', ($, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    delete saved[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(saved) }))
+  return saved
 }
 
 async function texts(ui: Mounted<'terminal', 'Pane'>): Promise<string[]> {
@@ -107,6 +111,8 @@ async function texts(ui: Mounted<'terminal', 'Pane'>): Promise<string[]> {
 function turnRows(shown: string[], bars: number): string[] {
   return shown.filter(t => t.length === 6 + bars && /^(Turns | {6})/.test(t))
 }
+
+const mountPane = ($: Engine) => $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
 
 describe('表示の部品', () => {
   test('使用率のしきい値で天気が変わる', () => {
@@ -163,54 +169,40 @@ describe('表示の部品', () => {
   })
 })
 
-describe('メモリの見つけ方', () => {
-  test('auto-memory の個別ファイルだけを拾い、索引と無関係なファイルは拾わない', () => {
-    expect(memoryFileName(`${MEMORY_DIR}/flow-html-structure.md`)).toBe('flow-html-structure.md')
-    expect(memoryFileName(INDEX_PATH)).toBeUndefined()
-    expect(memoryFileName('/Users/me/app/memory/notes.md')).toBeUndefined()
-    expect(memoryFileName('/Users/me/app/README.md')).toBeUndefined()
+describe('作業ログの部品', () => {
+  test('依頼・使ったツール（名前ごとの回数）・応答を Haiku への依頼にまとめる', () => {
+    expect(countTools(['Read', 'Bash', 'Read'])).toBe('Read ×2, Bash')
+    expect(logPrompt({ at: 0, prompt: 'バグを直して', tools: ['Read', 'Bash', 'Read'], answer: '直しました' })).toBe(
+      ['<turn>', '依頼: バグを直して', '使ったツール: Read ×2, Bash', '応答: 直しました', '</turn>'].join('\n'),
+    )
+    expect(logPrompt({ at: 0, prompt: '', tools: [], answer: 'x' })).toContain('使ったツール: なし')
   })
 
-  test('Bash コマンドの中のパスを重複なく拾う', () => {
-    const command = `cat '${MEMORY_DIR}/a.md' ${MEMORY_DIR}/b.md; cat ${MEMORY_DIR}/a.md ${INDEX_PATH}`
-    expect(memoryPathsIn(command)).toEqual([`${MEMORY_DIR}/a.md`, `${MEMORY_DIR}/b.md`])
-    expect(memoryPathsIn('ls -la')).toEqual([])
+  test('Haiku の返事を 1 行に整え、長すぎれば切る', () => {
+    expect(cleanEntry('\n- 「作業ログを足した。」\n補足')).toBe('作業ログを足した')
+    expect(cleanEntry('')).toBe('')
+    const long = cleanEntry('あ'.repeat(100))
+    expect(long).toHaveLength(60)
+    expect(long.endsWith('…')).toBe(true)
   })
 
-  test('注入された文章から見出しを拾い、索引を見分け、パスを短くする', () => {
-    expect(loadedFilesIn(INSTRUCTIONS).map(f => f.path)).toEqual([`${HOME}/.claude/CLAUDE.md`, `${ROOT}/.claude/CLAUDE.md`, INDEX_PATH])
-    expect(loadedFilesIn(INSTRUCTIONS)[2]?.label).toBe("user's auto-memory, persists across conversations")
-    expect(loadedFilesIn('no headings here')).toEqual([])
-    expect(isMemoryIndex(INDEX_PATH)).toBe(true)
-    expect(isMemoryIndex(`${MEMORY_DIR}/a.md`)).toBe(false)
-    expect(shorten(`${ROOT}/web/CLAUDE.md`, ROOT, HOME)).toBe('web/CLAUDE.md')
-    expect(shorten(`${HOME}/.claude/CLAUDE.md`, ROOT, HOME)).toBe('~/.claude/CLAUDE.md')
-    expect(shorten('/etc/claude/CLAUDE.md', ROOT, HOME)).toBe('/etc/claude/CLAUDE.md')
-  })
-
-  test('注意書きの日数・索引の項目数・名前と日数の整形', () => {
-    expect(ageDaysIn(AGE_NOTE)).toBe(48)
-    expect(ageDaysIn('This memory is 1 day old.')).toBe(1)
-    expect(ageDaysIn('1\t---')).toBeUndefined()
-    expect(ageDaysIn(undefined)).toBeUndefined()
-    expect(countEntries(INDEX_TEXT)).toBe(2)
-    expect(parseEntries(INDEX_TEXT)).toEqual([
-      { title: 'Flow HTML structure', file: 'flow-html-structure.md' },
-      { title: 'Intern materials', file: 'intern-materials.md' },
-    ])
-    expect(parseEntries('# Memory index\n\nno entries')).toEqual([])
-    expect(stem('flow-html-structure.md')).toBe('flow-html-structure')
-    expect([formatAge(48), formatAge(undefined)]).toEqual(['48d', ''])
+  test('この PC の時刻での日付と時刻、プロジェクト名、日報への材料', () => {
+    const at = new Date(2026, 9, 27, 9, 5).getTime()
+    expect(dayKey(at)).toBe('2026-10-27')
+    expect(formatClock(at)).toBe('09:05')
+    expect(projectName('/Users/me/app/')).toBe('app')
+    expect(recapPrompt([entry(at, 'バグを直した')])).toBe('<log>\n09:05 [app] バグを直した\n</log>')
+    expect(plainRecap([entry(at, 'バグを直した')])).toBe('- 09:05 [app] バグを直した')
   })
 })
 
 describe('サイドバー', () => {
-  test('天気・メモリ・使用量の枠をカードで出す', async ($, on) => {
+  test('天気・使用量の枠・作業ログをカードで出す', async ($, on) => {
     mock.clock(on)
     engine(on)
 
     await measure($, { tokens: 116_000, window: 200_000, percent: 58 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     const shown = await texts(ui)
 
     expect(shown).toContain('⛅ Cloudy')
@@ -219,10 +211,10 @@ describe('サイドバー', () => {
     expect(shown).toContain('44k until auto-compact')
     // 内訳のカードはもう出さない
     expect(shown).not.toContain('Breakdown (est.)')
-    // 索引はコンテキストに載っている。個別ファイルはまだ読んでいない
-    expect(shown).toContain('🧠 Memory')
-    expect(shown).toContain('Index 2 entries')
-    expect(shown).toContain('No memory file read yet')
+    // メモリのカードの代わりに作業ログのカード。まだ 1 行もない
+    expect(shown).not.toContain('🧠 Memory')
+    expect(shown).toContain('📝 Work log')
+    expect(shown).toContain('No turn logged yet')
     // 5 時間枠が先、週の枠が後。名前の幅を揃えて、使用率とバーを並べる
     const rows = shown.filter(t => t.startsWith('5-hour') || t.startsWith('Weekly'))
     expect(rows.map(t => t.slice(0, 7))).toEqual(['5-hour ', 'Weekly '])
@@ -231,107 +223,13 @@ describe('サイドバー', () => {
     expect(shown).toContain('Usage limits')
   })
 
-  test('読んだメモリを新しい順に、日数つきで並べる', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-    tools(on)
-
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/flow-html-structure.md` })
-    await $.tool.call({ tool: 'Read', file_path: '/Users/me/app/README.md' })
-    await $.tool.call({ tool: 'Bash', command: `cat ${MEMORY_DIR}/intern-materials.md` })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-    const shown = await texts(ui)
-
-    expect(memoryRows(shown)).toEqual([['', 'intern-materials'], ['', 'flow-html-structure', '48d']])
-    expect(shown).not.toContain('No memory file read yet')
-    expect(shown).not.toContain('* loaded by the engine')
-  })
-
-  test('同じメモリを読み直すと 1 件にまとめて上に上がる', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-    tools(on)
-
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md` })
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/b.md` })
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md` })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-
-    expect(memoryRows(await texts(ui)).map(r => r[1])).toEqual(['a', 'b'])
-  })
-
-  test('起動時に勝手に差し込まれた CLAUDE.md と索引を、印つきで出す', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-
-    await inject($, 'instructions', INSTRUCTIONS)
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-    const shown = await texts(ui)
-
-    // 索引は Index の行で示し、一覧には出さない。トークン数は内訳が来るまで分からない
-    expect(shown).toContain('Index 2 entries')
-    expect(shown.filter(t => t.includes('MEMORY'))).toEqual([])
-    expect(memoryRows(shown)).toEqual([['*', '.claude/CLAUDE.md'], ['*', '~/.claude/CLAUDE.md']])
-    expect(shown).toContain('* loaded by the engine')
-  })
-
-  test('ディレクトリに触れたときの CLAUDE.md と、本文に現れた想起メモリも拾う', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-
-    await inject($, 'nested_memory', `Contents of ${ROOT}/web/CLAUDE.md (project instructions, checked into the codebase):\n\n# Web`)
-    await inject($, 'some_recall', `<system-reminder>Recalled: ${MEMORY_DIR}/flow-html-structure.md\n---\nname: flow-html-structure</system-reminder>`)
-    await inject($, 'todo_reminder', 'Your todo list is empty.')
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-
-    expect(memoryRows(await texts(ui))).toEqual([['*', 'flow-html-structure'], ['*', 'web/CLAUDE.md']])
-  })
-
-  test('エンジン自身のループが読んだメモリは auto、Claude が読んだものと区別する', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-    tools(on)
-
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md`, agentId: 'engine-memory-fork' } as never)
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/b.md` })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-
-    expect(memoryRows(await texts(ui))).toEqual([['', 'b', '48d'], ['*', 'a', '48d']])
-  })
-
-  test('エンジンが数える CLAUDE.md は印つきで出し、応答のたびに来ても読んだものの上に出てこない', async ($, on) => {
-    mock.clock(on)
-    engine(on, undefined, WITH_CLAUDE_MD)
-    tools(on)
-
-    await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md` })
-    await measure($, { tokens: 12_000, window: 200_000, percent: 6 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-
-    expect(memoryRows(await texts(ui))).toEqual([['', 'a', '48d'], ['*', '~/.claude/CLAUDE.md']])
-  })
-
-  test('プロンプトが送られた時点で内訳を取り直し、最初の応答を待たずに索引を出す', async ($, on) => {
-    mock.clock(on)
-    engine(on, undefined, WITH_CLAUDE_MD)
-    on('turn.start', ($, e) => ({ turnId: e.turnId }))
-
-    await $.turn.start({ text: 'hi', turnId: 't1' })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-    const shown = await texts(ui)
-
-    expect(shown).toContain('Index 2 entries')
-    expect(memoryRows(shown)).toEqual([['*', '~/.claude/CLAUDE.md']])
-  })
-
   test('起動してからの経過時間を出す', async ($, on) => {
     // エンジンは startedAt: 0 を答えるので、いまが 65 分なら 1h 5m
     mock.clock(on, { now: 65 * 60_000 })
     engine(on)
 
     await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect(await texts(ui)).toContain('⏱ 1h 5m since start')
   })
 
@@ -343,7 +241,7 @@ describe('サイドバー', () => {
     const done = (turnId: string, durationMs: number, agentId?: string) =>
       $.turn.complete({ turnId, durationMs, answer: 'ok', isAborted: false, reason: 'answer', ...(agentId ? { agentId } : {}) } as never)
     await done('t1', 18_000)
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     // 1 ターン目から棒 1 本で出す。作業していないので丸はいない
     expect(turnRows(await texts(ui), 1)).toEqual(['       ', '      ▇', 'Turns █'])
 
@@ -359,8 +257,7 @@ describe('サイドバー', () => {
   test('作業中だけ丸が Turns の段を左から跳んでいき、終わると消える', async ($, on) => {
     const clock = mock.clock(on)
     engine(on)
-    on('turn.start', ($, e) => ({ turnId: e.turnId }))
-    on('turn.complete', ($, e) => ({ text: e.answer }))
+    loop(on)
 
     const done = (turnId: string, durationMs: number, agentId?: string) =>
       $.turn.complete({ turnId, durationMs, answer: 'ok', isAborted: false, reason: 'answer', ...(agentId ? { agentId } : {}) } as never)
@@ -368,7 +265,7 @@ describe('サイドバー', () => {
     await done('t1', 10_000)
     await done('t2', 40_000)
     await done('t3', 20_000)
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     // 丸のいる [上から何行目, 何列目の棒]。いなければ undefined
     const at = async (bars: number) => {
       const rows = turnRows(await texts(ui), bars)
@@ -404,70 +301,57 @@ describe('サイドバー', () => {
     on('session.measure', ($, e) => ({ changed: e.changed }))
     // 測り直しは枠の読みを返さないエンジン
     on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000 }, rateLimits: [] } }))
-    on('agent.list', () => ({ value: [] }))
     on('tool.call', { tool: 'Bash' }, () => ({ ref: 1, text: 'ok', result: { stdout: 'ok', stderr: '', interrupted: false } }))
 
     // 枠に変化はない（changed に rateLimits がない）が、まだ何も持っていないので取り込む
     await $.session.measure({ context: { tokens: 10_000, window: 200_000, percent: 5 }, rateLimits: LIMITS, changed: ['context'] } as never)
     // ツール呼び出しの測り直しは枠を返さないが、持っている枠は残る
     await $.tool.call({ tool: 'Bash', command: 'ls' })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect(await texts(ui)).toContain('Usage limits')
   })
 
-  test('推移・ターン時間・読んだメモリは $.store に写される', async ($, on) => {
+  test('推移とターン時間は $.store に写される', async ($, on) => {
     mock.clock(on, { now: 1_000 })
+    const saved = store(on, { 'series:s1': { savedAt: 0, history: [], turns: [], reads: [{ name: 'old' }] } })
     engine(on)
-    tools(on)
-    on('session.id', () => ({ value: 's1' }))
     on('turn.complete', ($, e) => ({ text: e.answer }))
-    // テストの $ には store がないので、書かれたものを自前で受け止める
-    const saved: Record<string, unknown> = {}
-    on('store.get', ($, e) => ({ value: saved[e.key] }))
-    on('store.set', ($, e) => {
-      saved[e.key] = e.value
-      return { value: undefined }
-    })
-    on('store.keys', () => ({ value: Object.keys(saved) }))
 
     await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
     await measure($, { tokens: 12_000, window: 200_000, percent: 6 })
     await $.turn.complete({ turnId: 't1', durationMs: 18_000, answer: 'ok', isAborted: false, reason: 'answer' } as never)
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/a.md` })
 
-    expect(saved['series:s1']).toMatchObject({ history: [5, 6], turns: [18_000], reads: [{ name: 'a', how: 'tool', ageDays: 48 }], savedAt: 1_000 })
+    // 以前の版が残した読んだメモリは、書き直すときに落とす
+    expect(saved['series:s1']).toEqual({ history: [5, 6], turns: [18_000], savedAt: 1_000 })
   })
 
-  test('再読み込みで状態が空になっても、起動時に $.store から戻る', async ($, on) => {
-    mock.clock(on)
-    mock.store(on, {
-      'series:s0': { savedAt: 1, history: [1], turns: [], reads: [] },
-      'series:s1': { savedAt: 2, history: [20, 50, 88], turns: [18_000, 42_000], reads: [{ name: 'a', path: `${MEMORY_DIR}/a.md`, at: 2, how: 'tool', ageDays: 48 }] },
+  test('再読み込みで状態が空になっても、起動時に $.store から戻り、古い日の作業ログは消える', async ($, on) => {
+    mock.clock(on, { now: NOON })
+    const saved = store(on, {
+      'series:s0': { savedAt: 1, history: [1], turns: [] },
+      'series:s1': { savedAt: 2, history: [20, 50, 88], turns: [18_000, 42_000] },
+      'log:2026-10-26:s1': [entry(NOON - 86_400_000, '昨日の作業')],
+      'log:2026-10-27:s1': [entry(NOON - 60_000, '今日の作業')],
+      'log:2026-10-27:s2': [entry(NOON - 30_000, '別のセッションの作業')],
+      'log:2026-10-01:s1': [entry(NOON - 26 * 86_400_000, '古い作業')],
     })
     // 起動時の測り直しで使用量が入り、天気カードが描かれる
     engine(on, { tokens: 20_000, window: 200_000, percent: 10 })
-    on('session.id', () => ({ value: 's1' }))
     on('session.start', ($, e) => ({ cwd: e.cwd }))
-    on('command.register', () => ({ value: { command: 'weather' } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
     on('ui.open', () => ({ value: { isPlaced: true } }))
 
     await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     const shown = await texts(ui)
 
     expect(shown).toContain('Trend ▂▅█')
     expect(shown).toContain('Last turn 42s · avg 30s')
-    expect(memoryRows(shown)).toEqual([['', 'a', '48d']])
-  })
-
-  test('索引がないプロジェクトでは、ないと言う', async ($, on) => {
-    mock.clock(on)
-    on('session.measure', ($, e) => ({ changed: e.changed }))
-    on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, breakdown: { ...BREAKDOWN, memoryFiles: [] } }, rateLimits: [] } }))
-
-    await measure($, { tokens: 10_000, window: 200_000, percent: 5 }, [])
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-    expect(await texts(ui)).toContain('Index not in context')
+    // このセッションの分だけを、新しいものを上に
+    const logged = shown.filter(t => t.endsWith('の作業'))
+    expect(logged).toEqual(['今日の作業', '昨日の作業'])
+    expect(saved['log:2026-10-01:s1']).toBeUndefined()
+    expect(saved['log:2026-10-27:s2']).toBeDefined()
   })
 
   test('応答を重ねると推移が伸び、かみなりで注意を出す', async ($, on) => {
@@ -476,7 +360,7 @@ describe('サイドバー', () => {
 
     await measure($, { tokens: 40_000, window: 200_000, percent: 20 })
     await measure($, { tokens: 176_000, window: 200_000, percent: 88 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     const shown = await texts(ui)
 
     expect(shown).toContain('⛈ Stormy')
@@ -487,7 +371,7 @@ describe('サイドバー', () => {
   test('計測前は控えめに出す', async ($, on) => {
     mock.clock(on)
 
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect(await texts(ui)).toContain('🌫 Not measured yet')
   })
 
@@ -497,25 +381,29 @@ describe('サイドバー', () => {
     tools(on)
 
     await $.tool.call({ tool: 'Bash', command: 'ls' })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect(await texts(ui)).toContain('☀️ Sunny')
   })
 
-  test('/clear のあとは計測前に戻り、読んだメモリも忘れる', async ($, on) => {
-    mock.clock(on)
+  test('/clear のあとは計測前に戻り、作業ログの表示も空になるが、日報用の控えは残る', async ($, on) => {
+    const clock = mock.clock(on, { now: NOON })
+    const saved = store(on, {})
     engine(on)
     tools(on)
+    loop(on)
+    haiku(on, () => 'バグを直した')
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
 
     await measure($, { tokens: 116_000, window: 200_000, percent: 58 })
-    await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/flow-html-structure.md` })
+    await work($, 't1', 'バグを直して', '直しました', [() => $.tool.call({ tool: 'Bash', command: 'ls' })])
+    await clock.advance(10)
     await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} } as never)
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     const shown = await texts(ui)
 
     expect(shown).toContain('🌫 Not measured yet')
-    expect(shown).toContain('No memory file read yet')
-    expect(shown).toContain('Index not in context')
+    expect(shown).toContain('No turn logged yet')
+    expect(saved['log:2026-10-27:s1']).toEqual([entry(NOON, 'バグを直した')])
   })
 
   test('入力欄の上の帯にはもう描かない', async ($, on) => {
@@ -535,13 +423,120 @@ describe('サイドバー', () => {
   })
 })
 
+describe('作業ログ', () => {
+  test('ターンが終わると、依頼と使ったツールと応答から Haiku に 1 行書かせ、新しいものを上に出す', async ($, on) => {
+    const clock = mock.clock(on, { now: NOON })
+    const saved = store(on, {})
+    engine(on)
+    tools(on)
+    loop(on)
+    const model = haiku(on, prompt => (prompt.includes('バグを直して') ? '- 「ログインのバグを直した。」' : '設計を説明した'))
+
+    await work($, 't1', 'バグを直して', '直しました', [
+      () => $.tool.call({ tool: 'Bash', command: 'ls' }),
+      () => $.tool.call({ tool: 'Read', file_path: '/a' }),
+      () => $.tool.call({ tool: 'Read', file_path: '/b' }),
+      // サブエージェントが呼んだツールは数えない
+      () => $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never),
+    ])
+    await work($, 't2', '設計を教えて', LONG_ANSWER)
+    await clock.advance(10)
+
+    expect(model.prompts[0]).toContain('依頼: バグを直して')
+    expect(model.prompts[0]).toContain('使ったツール: Bash, Read ×2')
+    expect(model.prompts[1]).toContain('使ったツール: なし')
+
+    const shown = await texts(await mountPane($))
+    expect(shown.filter(t => t === 'ログインのバグを直した' || t === '設計を説明した')).toEqual(['設計を説明した', 'ログインのバグを直した'])
+    expect(saved['log:2026-10-27:s1']).toEqual([entry(NOON, 'ログインのバグを直した'), entry(NOON, '設計を説明した')])
+  })
+
+  test('サブエージェントのターン、中断したターン、短いあいさつは書かない', async ($, on) => {
+    const clock = mock.clock(on, { now: NOON })
+    store(on, {})
+    engine(on)
+    tools(on)
+    loop(on)
+    const model = haiku(on, () => 'なにかした')
+
+    await $.turn.start({ text: '調べて', turnId: 'sub', agentId: 'sub-1' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never)
+    await $.turn.complete({ turnId: 'sub', durationMs: 1, answer: LONG_ANSWER, isAborted: false, reason: 'answer', agentId: 'sub-1' } as never)
+    await $.turn.start({ text: '直して', turnId: 't1' })
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    await $.turn.complete({ turnId: 't1', durationMs: 1, answer: '', isAborted: true, reason: 'aborted' } as never)
+    await work($, 't2', 'ありがとう', 'どういたしまして')
+    await clock.advance(10)
+
+    expect(model.prompts).toEqual([])
+    expect(await texts(await mountPane($))).toContain('No turn logged yet')
+  })
+
+  test('畳んでいるときは新しい 5 件を 1 行ずつ、開くと全部を時刻つきで出す', async ($, on) => {
+    mock.clock(on, { now: NOON })
+    const at = (i: number) => new Date(2026, 9, 27, 9, i).getTime()
+    store(on, { 'log:2026-10-27:s1': [1, 2, 3, 4, 5, 6, 7].map(i => entry(at(i), `作業${i}`)) })
+    engine(on)
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    // /nippo の登録が断られても（同じ名前の組み込みコマンドができたときなど）、起動時の復元は続く
+    on('command.register', ($, e) => (e.name === 'nippo' ? { deny: 'it is a built-in command' } : { value: { command: e.name } }))
+    on('ui.log', () => ({ value: undefined }))
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    const ui = await mountPane($)
+    const folded = await texts(ui)
+    expect(folded.filter(t => /^作業\d$/.test(t))).toEqual(['作業7', '作業6', '作業5', '作業4', '作業3'])
+    expect(folded).toContain('+2 more')
+    expect(folded).not.toContain("/nippo drafts today's report")
+
+    await ui.press({ key: 'log' })
+    const shown = await texts(ui)
+    expect(shown.filter(t => /^09:0\d 作業\d$/.test(t))).toEqual(['09:07 作業7', '09:06 作業6', '09:05 作業5', '09:04 作業4', '09:03 作業3', '09:02 作業2', '09:01 作業1'])
+    expect(shown).not.toContain('+2 more')
+    expect(shown).toContain("/nippo drafts today's report")
+  })
+
+  test('/nippo は、今日の作業ログを全セッション分集めて Haiku に日報の下書きを書かせる', async ($, on) => {
+    mock.clock(on, { now: NOON })
+    store(on, {
+      'log:2026-10-26:s1': [entry(NOON - 86_400_000, '昨日の作業')],
+      'log:2026-10-27:s1': [entry(new Date(2026, 9, 27, 10, 0).getTime(), 'バグを直した')],
+      'log:2026-10-27:s2': [entry(new Date(2026, 9, 27, 9, 0).getTime(), '資料を調べた', 'docs')],
+    })
+    const model = haiku(on, () => '### app\n- バグを直した\n')
+
+    const result = await $.command.run({ command: 'nippo', args: '' } as never)
+
+    expect(result.text).toBe('## 2026-10-27\n\n### app\n- バグを直した')
+    expect(model.prompts).toEqual(['<log>\n09:00 [docs] 資料を調べた\n10:00 [app] バグを直した\n</log>'])
+  })
+
+  test('/nippo は、ログがなければそう言い、Haiku が答えなければログを並べて返す', async ($, on) => {
+    mock.clock(on, { now: NOON })
+    const saved = store(on, {})
+    let answers = 0
+    on('model.complete', () => {
+      answers += 1
+      return { value: { isAnswered: false as const, reason: 'empty-reply' as const, usage: USAGE } }
+    })
+
+    expect((await $.command.run({ command: 'nippo', args: '' } as never)).text).toBe('No work logged today yet.')
+    expect(answers).toBe(0)
+
+    saved['log:2026-10-27:s1'] = [entry(new Date(2026, 9, 27, 10, 0).getTime(), 'バグを直した')]
+    expect((await $.command.run({ command: 'nippo', args: '' } as never)).text).toBe('## 2026-10-27\n\n- 10:00 [app] バグを直した')
+    expect(answers).toBe(1)
+  })
+})
+
 describe('カードの展開', () => {
   test('天気のカードを押すと内訳が出て、もう一度押すと畳む', async ($, on) => {
     mock.clock(on)
     engine(on)
 
     await measure($, { tokens: 116_000, window: 200_000, percent: 58 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect((await texts(ui)).some(t => t.startsWith('Messages'))).toBe(false)
 
     await ui.press({ key: 'weather' })
@@ -564,7 +559,7 @@ describe('カードの展開', () => {
 
     // 応答はまだないが、ツールを呼んだあとの測り直しで内訳だけは手に入る
     await $.tool.call({ tool: 'Bash', command: 'ls' })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     await ui.press({ key: 'weather' })
     const shown = await texts(ui)
 
@@ -572,37 +567,12 @@ describe('カードの展開', () => {
     expect(shown.some(t => t.startsWith('Messages'))).toBe(true)
   })
 
-  test('メモリのカードを押すと索引の項目と、読んだもの全部が出る', async ($, on) => {
-    mock.clock(on)
-    engine(on)
-    tools(on)
-
-    await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
-    for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
-      await $.tool.call({ tool: 'Read', file_path: `${MEMORY_DIR}/note-${n}.md` })
-    }
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
-    const folded = await texts(ui)
-    expect(memoryRows(folded)).toHaveLength(8)
-    expect(folded).toContain('+2 more')
-    expect(folded).not.toContain('  · Flow HTML structure')
-
-    await ui.press({ key: 'memory' })
-    const shown = await texts(ui)
-    expect(shown).toContain('Index 2 entries')
-    expect(shown).toContain('  · Flow HTML structure')
-    expect(shown).toContain('  · Intern materials')
-    expect(shown).toContain('Read this session')
-    expect(memoryRows(shown)).toHaveLength(10)
-    expect(shown).not.toContain('+2 more')
-  })
-
   test('枠のカードを押すとリセットまでの残り時間が出る', async ($, on) => {
     mock.clock(on, { now: Date.parse('2026-10-07T16:00:00Z') })
     engine(on)
 
     await measure($, { tokens: 10_000, window: 200_000, percent: 5 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     expect((await texts(ui)).some(t => t.includes(' left ('))).toBe(false)
 
     await ui.press({ key: 'limits' })
@@ -616,7 +586,7 @@ describe('カードの展開', () => {
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
 
     await measure($, { tokens: 116_000, window: 200_000, percent: 58 })
-    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'Pane', props: pane(), requestId: 'token-weather' })
+    const ui = await mountPane($)
     await ui.press({ key: 'weather' })
     await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} } as never)
 
