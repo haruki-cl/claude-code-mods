@@ -439,6 +439,8 @@ describe('作業ログ', () => {
       // サブエージェントが呼んだツールは数えない
       () => $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never),
     ])
+    // 作業ログは、ターンが終わった時刻でターンを見分ける
+    await clock.advance(1_000)
     await work($, 't2', '設計を教えて', LONG_ANSWER)
     await clock.advance(10)
 
@@ -448,7 +450,7 @@ describe('作業ログ', () => {
 
     const shown = await texts(await mountPane($))
     expect(shown.filter(t => t === 'ログインのバグを直した' || t === '設計を説明した')).toEqual(['設計を説明した', 'ログインのバグを直した'])
-    expect(saved['log:2026-10-27:s1']).toEqual([entry(NOON, 'ログインのバグを直した'), entry(NOON, '設計を説明した')])
+    expect(saved['log:2026-10-27:s1']).toEqual([entry(NOON, 'ログインのバグを直した'), entry(NOON + 1_000, '設計を説明した')])
   })
 
   test('サブエージェントのターン、中断したターン、短いあいさつは書かない', async ($, on) => {
@@ -470,6 +472,36 @@ describe('作業ログ', () => {
 
     expect(model.prompts).toEqual([])
     expect(await texts(await mountPane($))).toContain('No turn logged yet')
+  })
+
+  test('書き終わる前に読み込み直されても、起動時に控えから書く。書き終えていたターンは二重にしない', async ($, on) => {
+    const clock = mock.clock(on, { now: NOON })
+    const turn = (at: number, text: string) => ({ at, prompt: text, tools: ['Bash'], answer: 'ok' })
+    const saved = store(on, {
+      // 1 件目は書き終えたが控えから外す前に、2 件目は書く前に、読み込み直された
+      'pending:s1': [turn(NOON - 2_000, '書いた'), turn(NOON - 1_000, 'まだ')],
+      'log:2026-10-27:s1': [entry(NOON - 2_000, '書き終えていた作業')],
+      // 書き終わらないまま閉じたほかのセッションの控え。古いものだけ消す
+      'pending:s0': [turn(NOON - 30 * 86_400_000, '古い')],
+      'pending:s2': [turn(NOON - 60_000, '今日')],
+    })
+    engine(on)
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    const model = haiku(on, () => '控えから書いた作業')
+
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    await clock.advance(10)
+
+    expect(model.prompts).toHaveLength(1)
+    expect(model.prompts[0]).toContain('依頼: まだ')
+    expect(saved['log:2026-10-27:s1']).toEqual([entry(NOON - 2_000, '書き終えていた作業'), entry(NOON - 1_000, '控えから書いた作業')])
+    expect(saved['pending:s1']).toBeUndefined()
+    expect(saved['pending:s0']).toBeUndefined()
+    expect(saved['pending:s2']).toBeDefined()
+    const shown = await texts(await mountPane($))
+    expect(shown.filter(t => t.endsWith('作業'))).toEqual(['控えから書いた作業', '書き終えていた作業'])
   })
 
   test('畳んでいるときは新しい 5 件を 1 行ずつ、開くと全部を時刻つきで出す', async ($, on) => {

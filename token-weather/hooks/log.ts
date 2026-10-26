@@ -82,6 +82,10 @@ export function projectName(root: string): string {
   return root.replace(/\/+$/, '').split('/').at(-1) || root
 }
 
+export function isTurns(x: unknown): x is Turn[] {
+  return Array.isArray(x) && x.every(t => typeof t === 'object' && t !== null && typeof (t as Turn).at === 'number' && typeof (t as Turn).answer === 'string' && Array.isArray((t as Turn).tools))
+}
+
 export function isLog(x: unknown): x is LogEntry[] {
   return Array.isArray(x) && x.every(e => typeof e === 'object' && e !== null && typeof (e as LogEntry).at === 'number' && typeof (e as LogEntry).text === 'string')
 }

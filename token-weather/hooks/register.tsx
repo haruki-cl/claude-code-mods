@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
 
 import type { Card, Limit, LogEntry, Usage } from '../types'
-import { LOG_SYSTEM, RECAP_SYSTEM, cleanEntry, dayKey, formatClock, isLog, logPrompt, plainRecap, projectName, recapPrompt } from './log.ts'
+import { LOG_SYSTEM, RECAP_SYSTEM, cleanEntry, dayKey, formatClock, isLog, isTurns, logPrompt, plainRecap, projectName, recapPrompt } from './log.ts'
 import type { Turn } from './log.ts'
 import { HOPPER, bar, formatLeft, formatReset, formatSeconds, formatTokens, hopAt, limitColor, limitLabel, limitOrder, padCells, percentOf, sparkline, stepHeights, steps, weatherFor } from './weather.ts'
 
@@ -53,6 +53,11 @@ type Series = { savedAt: number; history: number[]; turns: number[] }
 const seriesKey = (sessionId: string) => `series:${sessionId}`
 // 日報用の作業ログの控え。日付とセッションごとに分けるので、同時に動く別のセッションと書き込みがぶつからない
 const logKey = (day: string, sessionId: string) => `log:${day}:${sessionId}`
+// ターンが終わってから作業ログに書き終えるまでの控え。そのあいだに読み込み直されても（タイマーは消える）、起動時に書き直せるよう残す
+const pendingKey = (sessionId: string) => `pending:${sessionId}`
+
+// 控えを書き出している最中なら、重ねて書き出さない。書き出しは控えを読み直しながら進むので、あとから足された分も拾う
+let flushing = false
 
 function isNumbers(x: unknown): x is number[] {
   return Array.isArray(x) && x.every(n => typeof n === 'number')
@@ -100,6 +105,16 @@ async function restoreLog($: EngineInterface): Promise<void> {
     const cutoff = dayKey((await $.clock.now()) - LOG_DAYS_KEPT * DAY_MS)
     const mine: LogEntry[] = []
     for (const key of await $.store.keys()) {
+      // 書き終わらないまま閉じた、ほかのセッションの控え。残す日数を過ぎたら消す
+      if (key.startsWith('pending:') && key !== pendingKey(id)) {
+        const pending = await $.store.get(key)
+        if (!isTurns(pending) || pending.every(t => dayKey(t.at) < cutoff)) {
+          await $.store.delete(key)
+        }
+
+        continue
+      }
+
       if (!key.startsWith('log:')) {
         continue
       }
@@ -162,27 +177,70 @@ async function refresh($: EngineInterface, withBreakdown: boolean): Promise<void
   }
 }
 
-// 1 ターンぶんの作業を Haiku に 1 行にまとめさせ、ペインと日報用の控えに足す。書けなかったときは理由をデバッグログに残すだけにする
+// 1 ターンぶんの作業を Haiku に 1 行にまとめさせ、ペインと日報用の控えに足す。書けなかったときは理由をデバッグログに残すだけにする。
+// 同じ時刻の行がもう控えにあれば書かない（書き終えてから控えを外す前に読み込み直されたときに、二重にしない）
 async function writeLog($: EngineInterface, turn: Turn): Promise<void> {
+  const key = logKey(dayKey(turn.at), await $.session.id())
+  const saved = await $.store.get(key)
+  if (isLog(saved) && saved.some(e => e.at === turn.at)) {
+    return
+  }
+
+  const result = await $.model.complete({ model: LOG_MODEL, system: LOG_SYSTEM, prompt: logPrompt(turn), maxTokens: 200 })
+  if (!result.isAnswered) {
+    $.ui.log(`作業ログを書けませんでした（${result.reason}）`, { to: 'debug' })
+    return
+  }
+
+  const text = cleanEntry(result.text)
+  if (text === '') {
+    return
+  }
+
+  const entry: LogEntry = { at: turn.at, project: projectName(await $.session.root()), text }
+  await update($, log, list => (list.some(e => e.at === entry.at) ? list : [...list, entry].slice(-LOG_KEPT)))
+  // Haiku を待つあいだに増えた分を消さないよう、読み直してから足す
+  const latest = await $.store.get(key)
+  await $.store.set(key, [...(isLog(latest) ? latest : []), entry])
+}
+
+// 書く予定のターンを控えに足す
+async function queueLog($: EngineInterface, turn: Turn): Promise<void> {
+  const key = pendingKey(await $.session.id())
+  const pending = await $.store.get(key)
+  await $.store.set(key, [...(isTurns(pending) ? pending : []), turn])
+}
+
+// 控えのターンを古い順に作業ログに書き、書いたら控えから外す。書けなかったもの（Haiku が答えないなど）も外し、何度も呼ばない
+async function flushLog($: EngineInterface): Promise<void> {
+  if (flushing) {
+    return
+  }
+
+  flushing = true
   try {
-    const result = await $.model.complete({ model: LOG_MODEL, system: LOG_SYSTEM, prompt: logPrompt(turn), maxTokens: 200 })
-    if (!result.isAnswered) {
-      $.ui.log(`作業ログを書けませんでした（${result.reason}）`, { to: 'debug' })
-      return
-    }
+    const key = pendingKey(await $.session.id())
+    for (;;) {
+      const pending = await $.store.get(key)
+      const turn = isTurns(pending) ? pending[0] : undefined
+      if (turn === undefined) {
+        break
+      }
 
-    const text = cleanEntry(result.text)
-    if (text === '') {
-      return
-    }
+      try {
+        await writeLog($, turn)
+      } catch (error) {
+        $.ui.log(`作業ログを書けませんでした（${String(error)}）`, { to: 'debug' })
+      }
 
-    const entry: LogEntry = { at: turn.at, project: projectName(await $.session.root()), text }
-    await update($, log, list => [...list, entry].slice(-LOG_KEPT))
-    const key = logKey(dayKey(turn.at), await $.session.id())
-    const saved = await $.store.get(key)
-    await $.store.set(key, [...(isLog(saved) ? saved : []), entry])
+      const latest = await $.store.get(key)
+      const rest = (isTurns(latest) ? latest : []).filter(t => t.at !== turn.at)
+      await (rest.length > 0 ? $.store.set(key, rest) : $.store.delete(key))
+    }
   } catch (error) {
     $.ui.log(`作業ログを書けませんでした（${String(error)}）`, { to: 'debug' })
+  } finally {
+    flushing = false
   }
 }
 
@@ -235,6 +293,8 @@ export const register: Register = on => {
     })
     await restoreSeries($)
     await restoreLog($)
+    // 前の読み込みで書き終わらなかったターンが控えにあれば、ここで書く
+    $.clock.after(0, () => void flushLog($))
     // ターンの途中で再読み込みされるとタイマーは消えるので、宙に浮いたまま止めずに消す
     await update($, hop, () => null)
     await refresh($, true)
@@ -305,11 +365,11 @@ export const register: Register = on => {
       const t = await update($, turns, list => [...list, e.durationMs].slice(-HISTORY))
       await saveSeries($, { turns: t })
 
-      // ターンの終わりを待たせないよう、作業ログはタイマーに回して書かせる
+      // ターンの終わりを待たせないよう、作業ログは控えに足してから、タイマーに回して書かせる
       const isWork = called.length > 0 || e.answer.trim().length >= LOG_MIN_ANSWER
       if (e.reason === 'answer' && isWork) {
-        const turn: Turn = { at: await $.clock.now(), prompt, tools: [...called], answer: e.answer }
-        $.clock.after(0, () => void writeLog($, turn))
+        await queueLog($, { at: await $.clock.now(), prompt, tools: [...called], answer: e.answer })
+        $.clock.after(0, () => void flushLog($))
       }
     }
 
